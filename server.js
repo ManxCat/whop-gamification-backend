@@ -52,19 +52,12 @@ app.get('/health', (req, res) => {
   res.json({ status: 'healthy' });
 });
 
-// OAuth callback - Exchange code for access token
-app.get('/auth/callback', async (req, res) => {
-  const { code } = req.query;
-  
-  if (!code) {
-    return res.status(400).json({ error: 'Authorization code missing' });
-  }
-
+// Test login endpoint (for development/testing)
+app.get('/auth/test-login', async (req, res) => {
   try {
-    // For now, create a test user since Whop OAuth requires credentials
     const testUser = {
       id: 'test_user_' + Date.now(),
-      username: 'TestUser',
+      username: 'TestUser' + Math.floor(Math.random() * 1000),
       email: 'test@example.com'
     };
 
@@ -75,14 +68,16 @@ app.get('/auth/callback', async (req, res) => {
     );
 
     if (user.rows.length === 0) {
-      // Create new user
+      // Create new user with some starting points
       const newUser = await pool.query(
         `INSERT INTO users (whop_user_id, username, email, level, xp, total_points, streak, created_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
          RETURNING *`,
-        [testUser.id, testUser.username, testUser.email, 1, 0, 0, 0]
+        [testUser.id, testUser.username, testUser.email, 1, 50, 100, 1]
       );
       user = newUser;
+      
+      console.log('✅ Created test user:', testUser.username);
     }
 
     // Create JWT
@@ -93,9 +88,81 @@ app.get('/auth/callback', async (req, res) => {
     );
 
     // Redirect to frontend with token
-    res.redirect(`${process.env.FRONTEND_URL}?token=${appToken}`);
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+    res.redirect(`${frontendUrl}?token=${appToken}`);
   } catch (error) {
-    console.error('OAuth error:', error);
+    console.error('Test login error:', error);
+    res.status(500).json({ error: 'Test login failed', details: error.message });
+  }
+});
+
+// OAuth callback - Exchange code for access token (for production Whop OAuth)
+app.get('/auth/callback', async (req, res) => {
+  const { code } = req.query;
+  
+  if (!code) {
+    return res.status(400).json({ error: 'Authorization code missing' });
+  }
+
+  try {
+    // If Whop credentials are configured, use real OAuth
+    if (WHOP_CONFIG.clientId && WHOP_CONFIG.clientSecret) {
+      // Exchange code for access token
+      const tokenResponse = await axios.post('https://api.whop.com/v2/oauth/token', {
+        client_id: WHOP_CONFIG.clientId,
+        client_secret: WHOP_CONFIG.clientSecret,
+        code: code,
+        grant_type: 'authorization_code',
+        redirect_uri: WHOP_CONFIG.redirectUri
+      });
+
+      const { access_token, refresh_token } = tokenResponse.data;
+
+      // Get user info from Whop
+      const userResponse = await axios.get(`${WHOP_CONFIG.apiUrl}/me`, {
+        headers: { Authorization: `Bearer ${access_token}` }
+      });
+
+      const whopUser = userResponse.data;
+
+      // Check if user exists in database
+      let user = await pool.query(
+        'SELECT * FROM users WHERE whop_user_id = $1',
+        [whopUser.id]
+      );
+
+      if (user.rows.length === 0) {
+        // Create new user
+        const newUser = await pool.query(
+          `INSERT INTO users (whop_user_id, username, email, access_token, refresh_token, level, xp, total_points, streak, created_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+           RETURNING *`,
+          [whopUser.id, whopUser.username, whopUser.email, access_token, refresh_token, 1, 0, 0, 0]
+        );
+        user = newUser;
+      } else {
+        // Update existing user tokens
+        await pool.query(
+          'UPDATE users SET access_token = $1, refresh_token = $2, last_login = NOW() WHERE whop_user_id = $3',
+          [access_token, refresh_token, whopUser.id]
+        );
+      }
+
+      // Create JWT for our app
+      const appToken = jwt.sign(
+        { userId: user.rows[0].id, whopUserId: whopUser.id },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+      );
+
+      // Redirect to frontend with token
+      res.redirect(`${process.env.FRONTEND_URL}?token=${appToken}`);
+    } else {
+      // Fallback to test user if Whop credentials not configured
+      res.redirect('/auth/test-login');
+    }
+  } catch (error) {
+    console.error('OAuth error:', error.response?.data || error.message);
     res.status(500).json({ error: 'Authentication failed' });
   }
 });
@@ -158,9 +225,13 @@ app.get('/api/user/profile', authenticateToken, async (req, res) => {
 app.get('/api/tasks/daily', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT dt.*, ut.completed, ut.progress, ut.completed_at
+      `SELECT dt.*, 
+              COALESCE(ut.completed, false) as completed, 
+              COALESCE(ut.progress, 0) as progress, 
+              ut.completed_at
        FROM daily_tasks dt
-       LEFT JOIN user_tasks ut ON dt.id = ut.task_id AND ut.user_id = $1 
+       LEFT JOIN user_tasks ut ON dt.id = ut.task_id 
+         AND ut.user_id = $1 
          AND DATE(ut.created_at) = CURRENT_DATE
        WHERE dt.active = true
        ORDER BY dt.id`,
@@ -190,13 +261,28 @@ app.post('/api/tasks/complete', authenticateToken, async (req, res) => {
 
     const task = taskResult.rows[0];
 
+    // Check if already completed today
+    const existingTask = await pool.query(
+      `SELECT * FROM user_tasks 
+       WHERE user_id = $1 AND task_id = $2 AND DATE(created_at) = CURRENT_DATE`,
+      [req.user.userId, taskId]
+    );
+
+    if (existingTask.rows.length > 0 && existingTask.rows[0].completed) {
+      return res.status(400).json({ error: 'Task already completed today' });
+    }
+
+    // Mark task as completed
     await pool.query(
       `INSERT INTO user_tasks (user_id, task_id, completed, progress, completed_at, created_at)
-       VALUES ($1, $2, true, $3, NOW(), NOW())`,
+       VALUES ($1, $2, true, $3, NOW(), NOW())
+       ON CONFLICT (user_id, task_id, created_at) DO NOTHING`,
       [req.user.userId, taskId, task.required_count]
     );
 
+    // Award XP
     await awardXP(req.user.userId, task.xp_reward);
+    await logActivity(req.user.userId, 'task', `Completed: ${task.name}`, task.xp_reward);
 
     res.json({ success: true, xpEarned: task.xp_reward });
   } catch (error) {
@@ -302,15 +388,29 @@ app.post('/api/rewards/redeem', authenticateToken, async (req, res) => {
       return res.status(400).json({ error: 'Insufficient points' });
     }
 
+    // Check if already redeemed
+    const existingRedemption = await pool.query(
+      'SELECT * FROM user_rewards WHERE user_id = $1 AND reward_id = $2',
+      [req.user.userId, rewardId]
+    );
+
+    if (existingRedemption.rows.length > 0) {
+      return res.status(400).json({ error: 'Reward already redeemed' });
+    }
+
+    // Deduct points
     await pool.query(
       'UPDATE users SET total_points = total_points - $1 WHERE id = $2',
       [reward.cost, req.user.userId]
     );
 
+    // Record redemption
     await pool.query(
       'INSERT INTO user_rewards (user_id, reward_id, redeemed_at) VALUES ($1, $2, NOW())',
       [req.user.userId, rewardId]
     );
+
+    await logActivity(req.user.userId, 'reward', `Redeemed: ${reward.name}`, -reward.cost);
 
     res.json({ success: true, message: 'Reward redeemed successfully' });
   } catch (error) {
@@ -346,6 +446,7 @@ app.post('/webhooks/whop', async (req, res) => {
 
   try {
     console.log('Webhook received:', event.type);
+    // Handle different webhook events here
     res.json({ success: true });
   } catch (error) {
     console.error('Webhook error:', error);
@@ -397,4 +498,5 @@ async function logActivity(userId, activityType, description, xpEarned) {
 app.listen(PORT, () => {
   console.log(`🚀 Whop Gamification API running on port ${PORT}`);
   console.log(`Environment: ${process.env.NODE_ENV}`);
+  console.log(`Frontend URL: ${process.env.FRONTEND_URL}`);
 });
